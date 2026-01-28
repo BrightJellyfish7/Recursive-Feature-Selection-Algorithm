@@ -427,3 +427,7 @@ de_sig = (
 de_sig_genes = de_sig.index.tolist()
 print("\n".join(de_sig_genes[:100])) 
 
+#Next Steps:
+# 1) Use de_sig_genes for enrichr analysis
+# 2) Use model.unique_gene_panel for enrichr analysis
+# 3) Compare results
