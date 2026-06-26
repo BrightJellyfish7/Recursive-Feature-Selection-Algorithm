@@ -1,0 +1,8 @@
+method,panel_size,hits,hit_genes,hypergeom_p
+Wilcoxon,50,0,[],1.0
+LogReg,50,0,[],1.0
+PermWilcoxon,50,0,[],1.0
+scVI,50,0,[],1.0
+YourAlgo_full,26,1,['Gene2'],0.05084463087698207
+YourAlgo_unique,9,1,['Gene2'],0.017870857189191108
+Hotspot,50,10,"['Gene9', 'Gene10', 'Gene8', 'Gene3', 'Gene4', 'Gene2', 'Gene7', 'Gene1', 'Gene5', 'Gene6']",3.851597437725382e-21
