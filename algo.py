@@ -368,7 +368,13 @@ class algo:
 				"logfc": s.get("logfc", np.nan), "pval": s.get("pval", np.nan),
 				"pval_adj": s.get("pval_adj", np.nan), "score": s.get("score", np.nan),
 			})
-		merged_df = pd.DataFrame(self.rows).sort_values("rf_rank").reset_index(drop=True)
+		# Columns are declared so an empty intersection still yields a frame with
+		# the right schema — otherwise pd.DataFrame([]) has no columns and the
+		# sort raises KeyError. Empty is a legitimate result: it means no selected
+		# gene was DE-significant, which is exactly what unique_gene_panel is for.
+		cols = ["gene", "rf_rank", "logfc", "pval", "pval_adj", "score"]
+		merged_df = (pd.DataFrame(self.rows, columns=cols)
+					 .sort_values("rf_rank").reset_index(drop=True))
 		return intersection, merged_df
 
 	def _unique_gene_panel(self):

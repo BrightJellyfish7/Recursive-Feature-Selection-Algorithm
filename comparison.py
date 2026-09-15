@@ -1,39 +1,121 @@
 """
-Benchmark: which methods recover staged co-expressed genes?
+Benchmark: which methods recover staged genes?
+
+build_adata stages a block of genes (n_staged) into group_2. Two designs:
+
+  stage_mode="bimodal"  (default) — each staged gene is OFF in half of group_2's
+    cells and ON in the other half, while group_1 sits steadily in the middle.
+    Both groups end up at the same expression level, so the difference is in the
+    SHAPE of the distribution, not its location. Wilcoxon tests stochastic
+    dominance and the t-test tests means, so both are blind; a tree can split on
+    a threshold, so RF-based selection recovers them.
+
+  stage_mode="coexpression" — matched marginals, correlated only within group_2.
+    Kept for comparison, but no method here recovers it: the signal lives between
+    genes, while every method scores each gene against the group label.
 
 Methods compared:
-  1. Wilcoxon DE (scanpy default) — univariate baseline
-  2. Logistic regression DE (scanpy) — multivariate-ish baseline
-  3. Permutation Wilcoxon — empirical null
-  4. Hotspot — co-expression / informative gene detector
-  5. scVI + DE on latent — neural latent space + DE
-  6. Your algo — recursive RF + GMM relabeling
+  1. Wilcoxon DE (scanpy) — univariate non-parametric baseline
+  2. t-test DE (scanpy) — univariate parametric baseline
+  3. Permutation Wilcoxon — empirical null (defined, commented out in main: slow)
+  4. scVI + DE on latent — neural latent space + DE (commented out in main)
+  5. Your algo — recursive RF + GMM relabeling
+
+Outputs: benchmark_results.csv, benchmark_top_genes.csv
 
 Required installs:
-  pip install hotspotsc scvi-tools tqdm
+  pip install scvi-tools tqdm
 
 Note: scVI requires PyTorch. If you don't already have it, on CPU:
   pip install torch --index-url https://download.pytorch.org/whl/cpu
 """
-
 import warnings
 warnings.filterwarnings("ignore")
-
 import gc
 import numpy as np
 import pandas as pd
 import anndata as ad
 import scanpy as sc
-from scipy.stats import hypergeom, mannwhitneyu
+from scipy.stats import hypergeom, mannwhitneyu, poisson
 from scsim import scsim
-
-import algo  # your algo module
+import algo 
 
 
 # =========================================================================
 # 1. Build staged dataset
 # =========================================================================
-def build_adata(sim_seed=32, stage_seed=0):
+def _match_high_mode(level, low, scale, max_k=400):
+	"""Find the ON level whose OFF/ON mixture matches `level` after normalization.
+
+	The tests operate on log1p(scale * counts), not on raw counts, and log1p is
+	not scale-invariant — so simply matching geometric means of the raw modes
+	leaves a location difference once per-cell normalization rescales them, and
+	the t-test then picks the genes up for the wrong reason. Here we solve
+	numerically for `high` such that
+
+	    0.5 * E[log1p(s*Pois(low))] + 0.5 * E[log1p(s*Pois(high))]
+	        == E[log1p(s*Pois(level))]
+
+	using exact Poisson expectations, so the staged genes differ from group_1 in
+	SHAPE only.
+	"""
+	k = np.arange(max_k)
+
+	def elog(mu):
+		w = poisson.pmf(k, mu)
+		return float(np.sum(w * np.log1p(scale * k)) / w.sum())
+
+	target = 2.0 * elog(level) - elog(low)
+	lo_b, hi_b = level, max(level * 50.0, level + 10.0)
+	if elog(hi_b) < target:            # cannot reach it; fall back to the bound
+		return hi_b
+	for _ in range(80):                # bisection: elog is increasing in mu
+		mid = 0.5 * (lo_b + hi_b)
+		if elog(mid) < target:
+			lo_b = mid
+		else:
+			hi_b = mid
+	return 0.5 * (lo_b + hi_b)
+
+
+def _stage_bimodal(rng, n1, n2, n_staged, level=8.0, low=2.0, scale=1.0):
+	"""On/off staging — the design DE is blind to.
+
+	Each staged gene is OFF in half of group_2's cells and ON in the other half,
+	while group_1 sits steadily in the middle. After normalization both groups
+	sit at the same expression level, so the difference is in the SHAPE of the
+	distribution, not its location: Wilcoxon tests stochastic dominance and the
+	t-test tests means, so both are blind, while a tree can still split on a
+	threshold.
+
+	`scale` is the per-cell normalization factor the pipeline will apply
+	(target_sum / median library size); it is what makes the location matching
+	hold on the data the tests actually see.
+	"""
+	high = _match_high_mode(level, low, scale)
+	g1_block = rng.poisson(level, size=(n1, n_staged))
+	on = rng.random((n2, n_staged)) < 0.5
+	g2_block = rng.poisson(np.where(on, high, low))
+	return g1_block, g2_block
+
+
+def _stage_coexpressed(rng, n1, n2, n_staged):
+	"""Co-expression staging — matched marginals, correlated only in group_2.
+
+	Kept for comparison. Note that no method in this benchmark recovers it: the
+	signal lives between genes, while every method here scores each gene against
+	the group label.
+	"""
+	g1_block = rng.negative_binomial(5, 0.5, size=(n1, n_staged))
+	g2_block = rng.negative_binomial(5, 0.5, size=(n2, n_staged))
+	shared_order = np.argsort(rng.standard_normal(n2))
+	for j in range(n_staged):
+		g2_block[:, j] = np.sort(g2_block[:, j])[shared_order]
+	return g1_block, g2_block
+
+
+def build_adata(sim_seed=32, stage_seed=0, n_staged=10, stage_mode="bimodal",
+				stage_level=8.0, stage_low=2.0):
 	simulator = scsim(
 		ngenes=5000, ncells=10000, ngroups=2,
 		libloc=7.64, libscale=0.78,
@@ -55,24 +137,31 @@ def build_adata(sim_seed=32, stage_seed=0):
 		lambda x: "group_1" if x == 1 else "group_2"
 	)
 
-	# Stage 10 co-expressed genes in group_2 (matched marginals via shared rank order)
+	# Overwrite the first n_staged genes with the staged signal.
 	rng = np.random.default_rng(stage_seed)
 	m1 = (adata.obs["group"] == "group_1").values
 	n1, n2 = int(m1.sum()), int((~m1).sum())
 
-	g1_block = rng.negative_binomial(5, 0.5, size=(n1, 10))
-	g2_block = rng.negative_binomial(5, 0.5, size=(n2, 10))
-	shared_order = np.argsort(rng.standard_normal(n2))
-	for j in range(10):
-		g2_block[:, j] = np.sort(g2_block[:, j])[shared_order]
+	if stage_mode == "bimodal":
+		# The scale the DE runners will see: normalize_total(target_sum=1e4).
+		lib = np.asarray(adata.X).sum(axis=1)
+		scale = 1e4 / float(np.median(lib))
+		g1_block, g2_block = _stage_bimodal(rng, n1, n2, n_staged,
+											level=stage_level, low=stage_low,
+											scale=scale)
+	elif stage_mode == "coexpression":
+		g1_block, g2_block = _stage_coexpressed(rng, n1, n2, n_staged)
+	else:
+		raise ValueError(f"stage_mode must be 'bimodal' or 'coexpression', "
+						 f"got {stage_mode!r}")
 
 	X = np.asarray(adata.X).copy().astype(np.int64)
-	X[m1, :10] = g1_block
-	X[~m1, :10] = g2_block
+	X[m1, :n_staged] = g1_block
+	X[~m1, :n_staged] = g2_block
 	adata.X = X
 	adata.obs["group"] = adata.obs["group"].astype("category")
 
-	staged_genes = list(adata.var_names[:10])
+	staged_genes = list(adata.var_names[:n_staged])
 	return adata, staged_genes
 
 
@@ -91,13 +180,13 @@ def run_wilcoxon(adata, n_top=50):
 	return list(a.uns["rank_genes_groups"]["names"]["group_2"][:n_top])
 
 
-def run_logreg(adata, n_top=50):
+def run_ttest(adata, n_top=50):
 	a = adata.copy()
 	sc.pp.normalize_total(a, target_sum=1e4)
 	sc.pp.log1p(a)
 	sc.tl.rank_genes_groups(
 		a, groupby="group", groups=["group_2"], reference="group_1",
-		method="logreg", use_raw=False, max_iter=500,
+		method="t-test", use_raw=False,
 	)
 	return list(a.uns["rank_genes_groups"]["names"]["group_2"][:n_top])
 
@@ -137,57 +226,7 @@ def run_permutation_wilcoxon(adata, n_perm=100, n_top=50, seed=0):
 	order = np.argsort(emp_p)
 	return list(a.var_names[order][:n_top])
 
-
-def run_hotspot(adata, n_top=50):
-	"""Hotspot — finds genes with informative local autocorrelation."""
-	import hotspot
-
-	a = adata.copy()
-	# Filter zero-variance genes (Hotspot requirement)
-	X_counts = np.asarray(a.X)
-	gene_var = X_counts.var(axis=0)
-	gene_sum = X_counts.sum(axis=0)
-	keep = (gene_var > 0) & (gene_sum > 0)
-	n_dropped = int((~keep).sum())
-	if n_dropped > 0:
-		print(f"  Dropping {n_dropped} zero-variance genes for Hotspot")
-	a = a[:, keep].copy()
-
-	# Hotspot needs raw counts in layers and a latent rep (use PCA on log-norm)
-	a.layers["counts"] = a.X.copy()
-	sc.pp.normalize_total(a, target_sum=1e4)
-	sc.pp.log1p(a)
-	sc.pp.scale(a, max_value=10)
-	sc.tl.pca(a, n_comps=30)
-
-	hs = hotspot.Hotspot(
-		a, layer_key="counts", model="danb",
-		latent_obsm_key="X_pca",
-	)
-	hs.create_knn_graph(weighted_graph=False, n_neighbors=30)
-	hs_results = hs.compute_autocorrelations()
-	hs_results = hs_results.sort_values("Z", ascending=False)
-	return list(hs_results.index[:n_top])
-
-
-def run_scvi_de(adata, n_top=50, max_epochs=50):
-	"""scVI latent + DE on group label."""
-	import scvi
-
-	a = adata.copy()
-	a.layers["counts"] = a.X.copy().astype(np.int64)
-	scvi.model.SCVI.setup_anndata(a, layer="counts", batch_key=None)
-	model = scvi.model.SCVI(a, n_latent=10, n_layers=2)
-	model.train(max_epochs=max_epochs, early_stopping=True, accelerator="cpu")
-
-	de_df = model.differential_expression(
-		groupby="group", group1="group_2", group2="group_1",
-	)
-	de_df = de_df.sort_values("bayes_factor", ascending=False)
-	return list(de_df.index[:n_top])
-
-
-def run_your_algo(adata, n_top=None, seed=42, max_iterations=25):
+def run_recursieve(adata, n_top=None, seed=42, max_iterations=25):
 	a = adata.copy()
 	model = algo.algo(
 		a, group1="group_1", group2="group_2",
@@ -201,7 +240,6 @@ def run_your_algo(adata, n_top=None, seed=42, max_iterations=25):
 		genes = genes[:n_top]
 	return genes, list(model.unique_gene_panel)
 
-
 # =========================================================================
 # 3. Evaluation
 # =========================================================================
@@ -210,7 +248,7 @@ def evaluate(method_name, hits_list, staged, total_genes, panel_size):
 	hits_in_panel = [g for g in hits_list[:panel_size] if g in staged]
 	n_hits = len(hits_in_panel)
 	# Hypergeometric: P(>= n_hits) when drawing panel_size from total_genes,
-	# 10 are staged
+	# len(staged) of which are staged
 	pval = hypergeom.sf(n_hits - 1, total_genes, len(staged), panel_size)
 	return {
 		"method": method_name,
@@ -234,7 +272,7 @@ if __name__ == "__main__":
 	results = []
 	all_top_genes = {}
 
-	# How many top genes each method returns. For your algo, use the actual
+	# How many top genes each method returns. For recursieve algo, use the actual
 	# number it picks; for others, match it (or use 50 as default).
 	N_TOP = 50
 
@@ -246,47 +284,32 @@ if __name__ == "__main__":
 	except Exception as e:
 		print(f"  Failed: {e}")
 
-	print("\n--- Logistic regression DE ---")
+	print("\n--- t-test DE ---")
 	try:
-		g = run_logreg(adata, n_top=N_TOP)
-		all_top_genes["LogReg"] = g
-		results.append(evaluate("LogReg", g, staged_genes, adata.n_vars, N_TOP))
+		g = run_ttest(adata, n_top=N_TOP)
+		all_top_genes["TTest"] = g
+		results.append(evaluate("TTest", g, staged_genes, adata.n_vars, N_TOP))
 	except Exception as e:
 		print(f"  Failed: {e}")
 
-	print("\n--- Permutation Wilcoxon (slow, n_perm=50) ---")
-	try:
-		g = run_permutation_wilcoxon(adata, n_perm=50, n_top=N_TOP, seed=0)
-		all_top_genes["PermWilcoxon"] = g
-		results.append(evaluate("PermWilcoxon", g, staged_genes, adata.n_vars, N_TOP))
-	except Exception as e:
-		print(f"  Failed: {e}")
+	# print("\n--- Permutation Wilcoxon (slow, n_perm=50) ---")
+	# try:
+	# 	g = run_permutation_wilcoxon(adata, n_perm=50, n_top=N_TOP, seed=0)
+	# 	all_top_genes["PermWilcoxon"] = g
+	# 	results.append(evaluate("PermWilcoxon", g, staged_genes, adata.n_vars, N_TOP))
+	# except Exception as e:
+	# 	print(f"  Failed: {e}")
 
-	print("\n--- Hotspot ---")
-	try:
-		g = run_hotspot(adata, n_top=N_TOP)
-		all_top_genes["Hotspot"] = g
-		results.append(evaluate("Hotspot", g, staged_genes, adata.n_vars, N_TOP))
-	except Exception as e:
-		print(f"  Failed: {e}")
 
-	print("\n--- scVI + DE ---")
+	print("\n--- recursieve algo ---")
 	try:
-		g = run_scvi_de(adata, n_top=N_TOP, max_epochs=50)
-		all_top_genes["scVI"] = g
-		results.append(evaluate("scVI", g, staged_genes, adata.n_vars, N_TOP))
-	except Exception as e:
-		print(f"  Failed: {e}")
-
-	print("\n--- Your algo ---")
-	try:
-		full, unique = run_your_algo(adata, seed=42)
-		all_top_genes["YourAlgo_full"] = full
-		all_top_genes["YourAlgo_unique"] = unique
+		full, unique = run_recursieve(adata, seed=42)
+		all_top_genes["recursieve_full"] = full
+		all_top_genes["recursieve_unique"] = unique
 		# Evaluate at the algo's natural panel size
-		results.append(evaluate("YourAlgo_full", full, staged_genes,
+		results.append(evaluate("recursieve_full", full, staged_genes,
 								adata.n_vars, len(full)))
-		results.append(evaluate("YourAlgo_unique", unique, staged_genes,
+		results.append(evaluate("recursieve_unique", unique, staged_genes,
 								adata.n_vars, len(unique)))
 	except Exception as e:
 		print(f"  Failed: {e}")
@@ -302,16 +325,15 @@ if __name__ == "__main__":
 
 	print("\nStaged genes found by each method:")
 	for r in results:
-		print(f"  {r['method']:<20s} ({r['hits']}/10): {r['hit_genes']}")
+		print(f"  {r['method']:<20s} ({r['hits']}/{len(staged_genes)}): {r['hit_genes']}")
 
-	print("\nTop 20 genes per method:")
+	print("\nTop 25 genes per method:")
 	for name, genes in all_top_genes.items():
 		print(f"\n{name}:")
-		print("  " + ", ".join(map(str, genes[:20])))
+		print("  " + ", ".join(map(str, genes[:25])))
 
 	# Save to CSV for later
 	df.to_csv("benchmark_results.csv", index=False)
 	pd.DataFrame({k: pd.Series(v) for k, v in all_top_genes.items()}).to_csv(
 		"benchmark_top_genes.csv", index=False
 	)
-	print("\nSaved: benchmark_results.csv, benchmark_top_genes.csv")
