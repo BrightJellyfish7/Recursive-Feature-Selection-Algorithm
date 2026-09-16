@@ -16,7 +16,7 @@ import scipy.sparse as sp
 from scipy.cluster.hierarchy import linkage, leaves_list
 
 
-class algo:
+class recursieve:
 	def __init__(self, adata, group1, group2, field_name="sample", plots=False,
 				 print_to_console=False, max_iterations=100, additive=True,
 				 flip_rate_percentage=0.01, pval_cutoff=0.05, seed=42,
@@ -319,11 +319,20 @@ class algo:
 				print(top_gene)
 			iteration += 1
 
-	def scanpy_de_original_groups(self, n_top=1000, method="wilcoxon"):
+	def scanpy_de_original_groups(self, n_top=None, method="wilcoxon"):
+		"""Build the DE reference set that unique_gene_panel is defined against.
+
+		n_genes is deliberately unbounded: rank_genes_groups sorts by score
+		DESCENDING, so capping it keeps the upregulated head and silently drops
+		the entire downregulated tail. That made de_dict one-sided, and every
+		down gene the RF picked then looked "not DE" to _unique_gene_panel.
+		n_top, if given, now caps by p-value (both directions) rather than by
+		scanpy's signed ranking.
+		"""
 		sc.tl.rank_genes_groups(
 			self.adata, groupby=self.field_name,
 			groups=[self.group2], reference=self.group1,
-			method=method, n_genes=n_top, use_raw=False,
+			method=method, n_genes=self.adata.n_vars, use_raw=False,
 		)
 		df = sc.get.rank_genes_groups_df(self.adata, group=self.group2)
 
@@ -334,9 +343,11 @@ class algo:
 		if not all([col_logfc, col_pval, col_padj]):
 			raise KeyError(f"DE columns missing. Got: {list(df.columns)}")
 
-		df = df[df[col_pval] < self.pval_cutoff]
+		df = df[df[col_pval] < self.pval_cutoff].sort_values(col_pval)
+		if n_top is not None:
+			df = df.head(int(n_top))
 		self.de_dict = OrderedDict()
-		for _, row in df.head(n_top).iterrows():
+		for _, row in df.iterrows():
 			self.de_dict[row["names"]] = {
 				"logfc": float(row[col_logfc]),
 				"pval": float(row[col_pval]),

@@ -26,19 +26,22 @@ Outputs: benchmark_results.csv, benchmark_top_genes.csv
 Required installs:
   pip install scvi-tools tqdm
 
-Note: scVI requires PyTorch. If you don't already have it, on CPU:
-  pip install torch --index-url https://download.pytorch.org/whl/cpu
 """
 import warnings
 warnings.filterwarnings("ignore")
 import gc
+import sys
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import anndata as ad
 import scanpy as sc
 from scipy.stats import hypergeom, mannwhitneyu, poisson
 from scsim import scsim
-import algo 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+	sys.path.insert(0, str(PROJECT_ROOT))
+import recursieve 
 
 
 # =========================================================================
@@ -228,7 +231,7 @@ def run_permutation_wilcoxon(adata, n_perm=100, n_top=50, seed=0):
 
 def run_recursieve(adata, n_top=None, seed=42, max_iterations=25):
 	a = adata.copy()
-	model = algo.algo(
+	model = recursieve.recursieve(
 		a, group1="group_1", group2="group_2",
 		field_name="group", max_iterations=max_iterations,
 		flip_rate_percentage=0.01, seed=seed,
@@ -238,7 +241,8 @@ def run_recursieve(adata, n_top=None, seed=42, max_iterations=25):
 	genes = list(model.genes)
 	if n_top is not None:
 		genes = genes[:n_top]
-	return genes, list(model.unique_gene_panel)
+	# unique_gene_panel is algo-defined uniqueness: not DE-significant by Scanpy DE.
+	return genes, list(model.unique_gene_panel), model
 
 # =========================================================================
 # 3. Evaluation
@@ -275,6 +279,7 @@ if __name__ == "__main__":
 	# How many top genes each method returns. For recursieve algo, use the actual
 	# number it picks; for others, match it (or use 50 as default).
 	N_TOP = 50
+	LOGFC_CUTOFF = 0.25
 
 	print("\n--- Wilcoxon DE ---")
 	try:
@@ -303,14 +308,41 @@ if __name__ == "__main__":
 
 	print("\n--- recursieve algo ---")
 	try:
-		full, unique = run_recursieve(adata, seed=42)
+		full, unique_de, model = run_recursieve(adata, seed=42)
+
+		# Baseline-defined uniqueness: in recursieve_full but absent from every
+		# non-recursive method list currently present in all_top_genes.
+		baseline_keys = [k for k in all_top_genes.keys() if not k.startswith("recursieve")]
+		baseline_gene_set = set()
+		for k in baseline_keys:
+			baseline_gene_set.update(g for g in all_top_genes[k] if pd.notna(g))
+		unique_vs_baselines = [g for g in full if g not in baseline_gene_set]
+
+		# DE uniqueness with an extra effect-size filter.
+		de_gene_set_logfc = set()
+		for g, stats in getattr(model, "de_dict", {}).items():
+			logfc = stats.get("logfc", np.nan)
+			if np.isfinite(logfc) and abs(logfc) >= LOGFC_CUTOFF:
+				de_gene_set_logfc.add(g)
+		unique_de_logfc = [g for g in full if g not in de_gene_set_logfc]
+
 		all_top_genes["recursieve_full"] = full
-		all_top_genes["recursieve_unique"] = unique
+		# Keep recursieve_unique aligned with benchmark column semantics:
+		# genes unique to recursieve vs other benchmark columns.
+		all_top_genes["recursieve_unique"] = unique_vs_baselines
+		# Also report the original algo-internal uniqueness definition.
+		all_top_genes["recursieve_unique_de"] = unique_de
+		all_top_genes[f"recursieve_unique_de_logfc{LOGFC_CUTOFF:g}"] = unique_de_logfc
 		# Evaluate at the algo's natural panel size
 		results.append(evaluate("recursieve_full", full, staged_genes,
 								adata.n_vars, len(full)))
-		results.append(evaluate("recursieve_unique", unique, staged_genes,
-								adata.n_vars, len(unique)))
+		results.append(evaluate("recursieve_unique", unique_vs_baselines,
+								staged_genes, adata.n_vars, len(unique_vs_baselines)))
+		results.append(evaluate("recursieve_unique_de", unique_de,
+								staged_genes, adata.n_vars, len(unique_de)))
+		results.append(evaluate(f"recursieve_unique_de_logfc{LOGFC_CUTOFF:g}",
+								unique_de_logfc, staged_genes,
+								adata.n_vars, len(unique_de_logfc)))
 	except Exception as e:
 		print(f"  Failed: {e}")
 
@@ -322,6 +354,7 @@ if __name__ == "__main__":
 	print("=" * 70)
 	df = pd.DataFrame(results)
 	print(df[["method", "panel_size", "hits", "hypergeom_p"]].to_string(index=False))
+	df_out = df[["method", "panel_size", "hits", "hit_genes"]].copy()
 
 	print("\nStaged genes found by each method:")
 	for r in results:
@@ -333,7 +366,7 @@ if __name__ == "__main__":
 		print("  " + ", ".join(map(str, genes[:25])))
 
 	# Save to CSV for later
-	df.to_csv("benchmark_results.csv", index=False)
+	df_out.to_csv("benchmark_results.csv", index=False)
 	pd.DataFrame({k: pd.Series(v) for k, v in all_top_genes.items()}).to_csv(
 		"benchmark_top_genes.csv", index=False
 	)
