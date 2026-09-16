@@ -1,3 +1,20 @@
+Metadata-Version: 2.4
+Name: recursieve
+Version: 0.1.0
+Summary: Iterative gene selection algorithm for single-cell group comparisons
+Author: Anushi Algo
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: anndata
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: scanpy
+Requires-Dist: scikit-learn
+Requires-Dist: scipy
+Requires-Dist: seaborn
+Requires-Dist: matplotlib
+
 # Recursieve
 
 Recursieve is an iterative gene selection algorithm that identifies discriminative genes between two biological groups in single-cell datasets. It uses an ensemble learning approach with a blend of random forest classifiers and gaussian mixture models to progressively select genes that best separate the groups, collapsing selected genes into a lower dimensional representational axis at each iteration.

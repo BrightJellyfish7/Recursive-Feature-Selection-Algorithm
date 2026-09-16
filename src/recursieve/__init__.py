@@ -17,21 +17,76 @@ from scipy.cluster.hierarchy import linkage, leaves_list
 
 
 class recursieve:
+	"""
+	Iterative gene selection using random forest and GMM clustering.
+
+	Recursively selects discriminative genes between two groups by training
+	random forests and collapsing selected genes via GMM. Stops when label
+	oscillation is detected or max iterations reached.
+
+	Parameters
+	----------
+	adata : anndata.AnnData
+		Annotated data matrix with cells in obs, genes in var.
+	group1 : str
+		Label of first group in field_name column.
+	group2 : str
+		Label of second group in field_name column.
+	field_name : str, optional
+		Column in obs containing group labels. Default is "sample".
+	plots : bool, optional
+		Generate visualization plots during iterations. Default is False.
+	print_to_console : bool, optional
+		Print selected genes to stdout. Default is False.
+	max_iterations : int, optional
+		Maximum number of selection iterations. Default is 100.
+	additive : bool, optional
+		If True, add new genes to panel. If False, use only latest gene.
+		Default is True.
+	flip_rate_percentage : float, optional
+		Threshold for label oscillation detection (0 to 1). Stop when label
+		flip rate drops below this. Default is 0.01.
+	pval_cutoff : float, optional
+		P-value threshold for differential expression filtering.
+		Default is 0.05.
+	seed : int, optional
+		Random seed for reproducibility (used in RF, train/test split, GMM).
+		Default is 42.
+	summary_method : str, optional
+		Method to collapse selected genes: "mean" averages expression,
+		"pca" uses first principal component. Default is "mean".
+	n_estimators : int, optional
+		Number of trees in random forest. Default is 300.
+	n_jobs : int, optional
+		Number of parallel jobs for RF. -1 uses all cores. Default is -1.
+
+	Attributes
+	----------
+	genes : list
+		Genes selected in order of selection.
+	acuracy_scores : list
+		Accuracy on test set for each iteration.
+	auc_scores : list
+		AUC on test set for each iteration.
+	unique_gene_panel : list
+		Genes in self.genes not in DE results (higher priority genes).
+
+	gene_expression_log : OrderedDict
+		Expression arrays for each selected gene.
+
+	Examples
+	--------
+	>>> import anndata as ad
+	>>> from recursieve import recursieve
+	>>> adata = ad.read_h5ad("data.h5ad")
+	>>> model = recursieve(adata, group1="ctrl", group2="treat",
+	...                     field_name="condition", max_iterations=50)
+	>>> print(model.unique_gene_panel[:5])
+	"""
 	def __init__(self, adata, group1, group2, field_name="sample", plots=False,
 				 print_to_console=False, max_iterations=100, additive=True,
 				 flip_rate_percentage=0.01, pval_cutoff=0.05, seed=42,
 				 summary_method="mean", n_estimators=300, n_jobs=-1):
-		"""
-		Parameters
-		----------
-		summary_method : "mean" | "pca"
-			How to collapse the running set of selected genes into a single axis
-			for the GMM step. "pca" uses the first principal component, which
-			handles redundant (co-expressed) genes better than mean.
-		seed : int
-			Controls RF, train/test split, and GMM. Set differently across runs
-			to assess stability.
-		"""
 		self.adata = adata
 		self.group1 = group1
 		self.group2 = group2
@@ -69,6 +124,22 @@ class recursieve:
 		self.unique_gene_panel = self._unique_gene_panel()
 
 	def replace_var_names(self):
+		"""
+		Replace gene names with feature names from var table.
+
+		Swaps var_names with values from var["feature_name"] and stores
+		original names in var["ensembl_id"].
+
+		Raises
+		------
+		KeyError
+			If "feature_name" column is not in adata.var.
+
+		Examples
+		--------
+		>>> model.replace_var_names()
+		>>> print(model.adata.var.columns)
+		"""
 		if "feature_name" in self.adata.var.columns:
 			self.adata.var["ensembl_id"] = self.adata.var_names.astype(str)
 			self.adata.var_names = self.adata.var["feature_name"].astype(str)
@@ -77,6 +148,23 @@ class recursieve:
 			raise KeyError("feature_name not found in adata.var.")
 
 	def preprocessing(self):
+		"""
+		Apply quality control and normalization to expression data.
+
+		Filters mitochondrial, ribosomal, and hemoglobin genes. Calculates
+		QC metrics, filters cells and genes by count thresholds, normalizes,
+		log-transforms, and selects top 2000 highly variable genes. Densifies
+		matrix if memory permits.
+
+		Notes
+		-----
+		Modifies self.adata in place. Stores original counts in layers.
+
+		Examples
+		--------
+		>>> model = recursieve(...)
+		>>> model.preprocessing()  # called automatically in __init__
+		"""
 		self.adata.layers["counts"] = self.adata.X.copy()
 		self.adata.var["mt"] = self.adata.var_names.str.upper().str.startswith("MT-")
 		self.adata.var["ribo"] = self.adata.var_names.str.upper().str.match(r"^RPS|^RPL")
@@ -84,8 +172,17 @@ class recursieve:
 		self.adata = self.adata[:, ~(self.adata.var["mt"] |
 									 self.adata.var["ribo"] |
 									 self.adata.var["hb"])].copy()
-		sc.pp.calculate_qc_metrics(self.adata, qc_vars=["mt", "ribo", "hb"],
-								   inplace=True, log1p=True)
+		percent_top = tuple(
+			p for p in (50, 100, 200, 300)
+			if p < self.adata.n_vars
+		)
+		sc.pp.calculate_qc_metrics(
+			self.adata,
+			qc_vars=["mt", "ribo", "hb"],
+			inplace=True,
+			log1p=True,
+			percent_top=percent_top,
+		)
 		sc.pp.filter_cells(self.adata, min_genes=100)
 		sc.pp.filter_genes(self.adata, min_cells=10)
 		sc.pp.normalize_total(self.adata)
@@ -101,6 +198,20 @@ class recursieve:
 				self.adata.X = self.adata.X.toarray()
 
 	def filter_groups(self):
+		"""
+		Subset data to cells from the two specified groups.
+
+		Keeps only cells with labels matching group1 or group2 in field_name.
+
+		Raises
+		------
+		ValueError
+			If either group has zero cells.
+
+		Examples
+		--------
+		>>> model.filter_groups()  # called automatically in __init__
+		"""
 		mask1 = self.adata.obs[self.field_name] == self.group1
 		mask2 = self.adata.obs[self.field_name] == self.group2
 		n1, n2 = int(mask1.sum()), int(mask2.sum())
@@ -115,7 +226,27 @@ class recursieve:
 		gc.collect()
 
 	def _get_X_dense(self, adata=None):
-		"""Return dense X view; densify on the fly if sparse."""
+		"""
+		Return dense expression matrix.
+
+		If input is sparse, convert to dense array. Otherwise return as is.
+
+		Parameters
+		----------
+		adata : anndata.AnnData, optional
+			Use this object instead of self.adata. Default is None.
+
+		Returns
+		-------
+		np.ndarray
+			Dense expression matrix of shape (n_obs, n_vars).
+
+		Examples
+		--------
+		>>> X = model._get_X_dense()
+		>>> X.shape
+		(5000, 2000)
+		"""
 		a = adata if adata is not None else self.adata
 		X = a.X
 		if sp.issparse(X):
@@ -123,6 +254,23 @@ class recursieve:
 		return X
 
 	def ensemble_learner(self):
+		"""
+		Train random forest and select top gene by importance.
+
+		Fits RF on all remaining genes, computes feature importances, and
+		selects the highest-ranked gene. Calculates accuracy and AUC on test
+		set. Stores gene expression and metrics.
+
+		Notes
+		-----
+		Runs on first call to select initial gene. Called automatically in
+		__init__ and ensemble_recursion().
+
+		Examples
+		--------
+		>>> model.ensemble_learner()  # called automatically
+		>>> print(model.genes[0])
+		"""
 		X = self._get_X_dense()
 		y = self.adata.obs[self.field_name].values
 
@@ -169,6 +317,21 @@ class recursieve:
 		self.gene_expression_log[top_gene] = np.asarray(expr).ravel().astype(np.float32)
 
 	def ensemble_learner_plots(self):
+		"""
+		Generate three plots of top gene expression.
+
+		Creates scatterplot (UMI vs expression), violin plot (group vs expr),
+		and histogram (expression density) for the highest-ranked gene.
+
+		Notes
+		-----
+		Called only if plots=True during initialization.
+
+		Examples
+		--------
+		>>> model = recursieve(..., plots=True)
+		>>> model.ensemble_learner_plots()
+		"""
 		top = self.df["genes"].iloc[0]
 		expr = self.adata[:, top].X
 		if sp.issparse(expr):
@@ -187,7 +350,23 @@ class recursieve:
 		plt.xlabel(top); plt.ylabel("Density"); plt.show(); plt.clf()
 
 	def _summarize_selected(self):
-		"""Collapse all selected gene expressions to a single 1D axis."""
+		"""
+		Collapse selected gene expressions to single 1D axis.
+
+		Uses PCA (first PC) or mean aggregation based on summary_method.
+		PCA handles co-expressed genes better by reducing redundancy.
+
+		Returns
+		-------
+		np.ndarray
+			1D float32 array of length n_cells.
+
+		Examples
+		--------
+		>>> summary = model._summarize_selected()
+		>>> summary.shape
+		(5000,)
+		"""
 		mat = np.column_stack([
 			v for k, v in self.gene_expression_log.items() if k != "summed"
 		])  # cells x n_selected
@@ -202,6 +381,33 @@ class recursieve:
 		return mat.mean(axis=1).astype(np.float32)
 
 	def cluster_infectivity_gmm(self, gene=None):
+		"""
+		Cluster cells using Gaussian Mixture Model on gene expression.
+
+		Fits 2-component GMM on log-transformed UMI and gene expression.
+		Assigns higher expression cluster label "1". Stores labels in obs.
+
+		Parameters
+		----------
+		gene : str, optional
+			Unused (kept for API compatibility). Uses latest gene from self.genes.
+
+		Returns
+		-------
+		tuple
+			(gmm_model, labels) where labels is (n_cells,) int array.
+
+		Notes
+		-----
+		If additive=True, uses summary of all selected genes. Otherwise
+		uses expression of single latest gene.
+
+		Examples
+		--------
+		>>> gmm, labels = model.cluster_infectivity_gmm()
+		>>> print(labels.shape)
+		(5000,)
+		"""
 		gene = self.genes[-1]
 
 		if self.additive:
@@ -240,15 +446,61 @@ class recursieve:
 
 	@staticmethod
 	def _flip_rate(a, b):
+		"""
+		Compute minimum label disagreement rate between two binary arrays.
+
+		Returns the minimum of disagreement rate and disagreement rate
+		with inverted labels (to account for label swap). Used to detect
+		when clustering is stable.
+
+		Parameters
+		----------
+		a : array-like
+			First binary array.
+		b : array-like
+			Second binary array.
+
+		Returns
+		-------
+		float
+			Minimum disagreement rate between 0 and 1.
+
+		Examples
+		--------
+		>>> a = np.array([0, 1, 1, 0])
+		>>> b = np.array([0, 1, 1, 0])
+		>>> recursieve._flip_rate(a, b)
+		0.0
+		"""
 		a = np.asarray(a).astype(int).ravel()
 		b = np.asarray(b).astype(int).ravel()
 		return float(min(np.mean(a != b), np.mean((1 - a) != b)))
 
 	def _check_oscillation(self, labels, window=3):
 		"""
-		Detect 2-cycle oscillation by comparing current labels to the
-		label set 2 iterations ago. If flip_rate to t-2 is near zero
-		but flip_rate to t-1 is large, we're oscillating.
+		Detect 2-cycle oscillation in cluster labels.
+
+		Compares current labels to labels from 2 iterations ago. If the
+		flip rate to t-2 is low but flip rate to t-1 is high, the algorithm
+		is oscillating between two states. Maintains a sliding window of
+		label history.
+
+		Parameters
+		----------
+		labels : array-like
+			Current cluster labels.
+		window : int, optional
+			Number of iterations to track. Default is 3.
+
+		Returns
+		-------
+		bool
+			True if 2-cycle oscillation detected, False otherwise.
+
+		Examples
+		--------
+		>>> labels = np.array([0, 1, 1, 0])
+		>>> is_osc = model._check_oscillation(labels)
 		"""
 		self.label_history.append(labels.copy())
 		if len(self.label_history) < window:
@@ -261,6 +513,31 @@ class recursieve:
 		return (fr_prev2 < self.flip_rate_percentage) and (fr_prev > self.flip_rate_percentage)
 
 	def ensemble_recursion(self, iteration=1):
+		"""
+		Iteratively select genes using RF and GMM clustering.
+
+		Runs main loop that selects genes one at a time. Each iteration:
+		1. Cluster cells with GMM on selected genes or single latest gene
+		2. Train RF on remaining genes using GMM labels
+		3. Select top gene by importance
+		Stops when label flip rate is low or oscillation detected.
+
+		Parameters
+		----------
+		iteration : int, optional
+			Starting iteration number. Default is 1.
+
+		Notes
+		-----
+		Called automatically in __init__. Updates self.genes, self.auc_scores,
+		self.accuracy_scores, and self.gene_expression_log.
+
+		Examples
+		--------
+		>>> model.ensemble_recursion()  # called automatically
+		>>> len(model.genes)
+		25
+		"""
 		self.prev_labels = None
 		while iteration <= self.max_iterations:
 			print(f"Iteration {iteration}")
@@ -320,14 +597,32 @@ class recursieve:
 			iteration += 1
 
 	def scanpy_de_original_groups(self, n_top=None, method="wilcoxon"):
-		"""Build the DE reference set that unique_gene_panel is defined against.
+		"""
+		Compute differential expression reference for gene filtering.
 
-		n_genes is deliberately unbounded: rank_genes_groups sorts by score
-		DESCENDING, so capping it keeps the upregulated head and silently drops
-		the entire downregulated tail. That made de_dict one-sided, and every
-		down gene the RF picked then looked "not DE" to _unique_gene_panel.
-		n_top, if given, now caps by p-value (both directions) rather than by
-		scanpy's signed ranking.
+		Ranks genes by differential expression between group1 and group2
+		using scanpy. Filters by p-value cutoff and stores results in
+		self.de_dict. Both upregulated and downregulated genes are included.
+
+		Parameters
+		----------
+		n_top : int, optional
+			Cap number of DE genes (after p-value filtering).
+			Default is None (no cap).
+		method : str, optional
+			Differential expression test ("wilcoxon", "t-test", etc).
+			Default is "wilcoxon".
+
+		Notes
+		-----
+		Called automatically in __init__. Stores DE info in self.de_dict
+		as OrderedDict with gene names as keys.
+
+		Examples
+		--------
+		>>> model.scanpy_de_original_groups(n_top=500, method="wilcoxon")
+		>>> print(len(model.de_dict))
+		500
 		"""
 		sc.tl.rank_genes_groups(
 			self.adata, groupby=self.field_name,
@@ -356,6 +651,35 @@ class recursieve:
 			}
 
 	def intersect_genes_and_de(self, top_n_genes=None, keep_order="genes", return_df=True):
+		"""
+		Find genes in both selected list and DE results.
+
+		Returns intersection of self.genes and self.de_dict keys, optionally
+		merged with DE statistics. Can order by RF rank or DE rank.
+
+		Parameters
+		----------
+		top_n_genes : int, optional
+			Use only first N genes from self.genes. Default is None (all).
+		keep_order : str, optional
+			"genes" orders by RF rank, "de" orders by DE rank.
+			Default is "genes".
+		return_df : bool, optional
+			If True, return (list, DataFrame). If False, return list only.
+			Default is True.
+
+		Returns
+		-------
+		tuple or list
+			If return_df=True: (gene_list, dataframe with DE stats).
+			If return_df=False: gene_list only.
+
+		Examples
+		--------
+		>>> hits, df = model.intersect_genes_and_de(top_n_genes=50)
+		>>> print(df.columns)
+		['gene', 'rf_rank', 'logfc', 'pval', 'pval_adj', 'score']
+		"""
 		genes_list = list(self.genes)
 		if top_n_genes is not None:
 			genes_list = genes_list[:int(top_n_genes)]
@@ -389,7 +713,24 @@ class recursieve:
 		return intersection, merged_df
 
 	def _unique_gene_panel(self):
-		"""Genes selected by algo but NOT in DE results, preserving RF rank order."""
+		"""
+		Extract high-priority genes not in differential expression results.
+
+		Returns genes selected by RF that were NOT found to be significantly
+		differentially expressed. These are novel candidates. Preserves
+		RF selection order.
+
+		Returns
+		-------
+		list
+			Genes in self.genes but not in self.de_dict, in RF order.
+
+		Examples
+		--------
+		>>> unique = model._unique_gene_panel()
+		>>> print(unique[:5])
+		['GENE1', 'GENE3', 'GENE5', ...]
+		"""
 		hits, _ = self.intersect_genes_and_de()
 		hits_set = set(hits)
 		# preserve order of self.genes (RF rank) instead of returning a set
@@ -397,6 +738,34 @@ class recursieve:
 
 	@staticmethod
 	def plot_common_expression(adata, genes_list):
+		"""
+		Visualizes Spearman correlation matrix of gene expressions.
+
+		Filters gene list to those in adata, computes log-transformed
+		expression correlations, hierarchically clusters, and plots as
+		heatmap with Spearman correlation coefficient.
+
+		Parameters
+		----------
+		adata : anndata.AnnData
+			Annotated data with gene expressions.
+		genes_list : list
+			Gene names to correlate.
+
+		Returns
+		-------
+		tuple
+			(genes_reordered, correlation_matrix) where genes_reordered is
+			clustered gene list and correlation_matrix is (n_genes, n_genes).
+			Returns (genes, None) if fewer than 2 valid genes.
+
+		Examples
+		--------
+		>>> genes_clustered, corr = model.plot_common_expression(
+		...     model.adata, model.genes[:10])
+		>>> print(corr.shape)
+		(10, 10)
+		"""
 		genes = [g for g in genes_list if g in adata.var_names]
 		if len(genes) < 2:
 			print("Need at least 2 genes to plot correlation.")
