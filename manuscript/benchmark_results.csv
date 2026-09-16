@@ -1,0 +1,7 @@
+method,panel_size,hits,hit_genes
+Wilcoxon,50,2,"['Gene4', 'Gene9']"
+TTest,50,0,[]
+recursieve_full,26,10,"['Gene10', 'Gene5', 'Gene8', 'Gene6', 'Gene9', 'Gene4', 'Gene1', 'Gene3', 'Gene7', 'Gene2']"
+recursieve_unique,19,8,"['Gene10', 'Gene5', 'Gene8', 'Gene6', 'Gene1', 'Gene3', 'Gene7', 'Gene2']"
+recursieve_unique_de,5,2,"['Gene6', 'Gene7']"
+recursieve_unique_de_logfc0.25,14,10,"['Gene10', 'Gene5', 'Gene8', 'Gene6', 'Gene9', 'Gene4', 'Gene1', 'Gene3', 'Gene7', 'Gene2']"
