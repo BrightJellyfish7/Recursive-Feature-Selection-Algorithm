@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recursieve"
+version = "0.1.0"
+description = "Iterative gene selection algorithm for single-cell group comparisons"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Anushi Algo" }
+]
+license = { text = "MIT" }
+dependencies = [
+  "anndata",
+  "numpy",
+  "pandas",
+  "scanpy",
+  "scikit-learn",
+  "scipy",
+  "seaborn",
+  "matplotlib",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

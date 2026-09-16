@@ -30,7 +30,6 @@ Required installs:
 import warnings
 warnings.filterwarnings("ignore")
 import gc
-import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -38,10 +37,7 @@ import anndata as ad
 import scanpy as sc
 from scipy.stats import hypergeom, mannwhitneyu, poisson
 from scsim import scsim
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-	sys.path.insert(0, str(PROJECT_ROOT))
-import recursieve 
+import recursieve
 
 
 # =========================================================================
@@ -365,8 +361,9 @@ if __name__ == "__main__":
 		print(f"\n{name}:")
 		print("  " + ", ".join(map(str, genes[:25])))
 
-	# Save to CSV for later
-	df_out.to_csv("benchmark_results.csv", index=False)
+	# Save to CSV for later in the directory the script was launched from.
+	output_dir = Path.cwd()
+	df_out.to_csv(output_dir / "benchmark_results.csv", index=False)
 	pd.DataFrame({k: pd.Series(v) for k, v in all_top_genes.items()}).to_csv(
-		"benchmark_top_genes.csv", index=False
+		output_dir / "benchmark_top_genes.csv", index=False
 	)
